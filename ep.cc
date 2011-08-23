@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sstream>
 #include <iostream>
+#include <fstream>
 #include <functional>
 
 #include "ep.hh"
@@ -32,6 +33,8 @@
 #include "ep_engine.h"
 #include "htresizer.hh"
 #include "checkpoint_remover.hh"
+
+std::ostream *BlockTimer::out;
 
 extern "C" {
     static rel_time_t uninitialized_current_time(void) {
@@ -244,7 +247,9 @@ public:
         hrtime_t start_time(gethrtime());
         vbucket_del_result result = ep->completeVBucketDeletion(vbucket, vbver);
         if (result == vbucket_del_success || result == vbucket_del_invalid) {
-            hrtime_t wall_time = (gethrtime() - start_time) / 1000;
+            hrtime_t spent(gethrtime() - start_time);
+            hrtime_t wall_time = spent / 1000;
+            BlockTimer::log(spent, "disk_vb_del");
             stats.diskVBDelHisto.add(wall_time);
             stats.vbucketDelMaxWalltime.setIfBigger(wall_time);
             stats.vbucketDelTotWalltime.incr(wall_time);
@@ -403,6 +408,10 @@ EventuallyPersistentStore::EventuallyPersistentStore(EventuallyPersistentEngine 
                      storageProperties.maxConcurrency(),
                      storageProperties.maxReaders(),
                      storageProperties.maxWriters());
+
+    if (getenv("TIMING_LOG")) {
+        BlockTimer::setDescriptor(new std::ofstream(getenv("TIMING_LOG")));
+    }
 
     doPersistence = getenv("EP_NO_PERSISTENCE") == NULL;
     dispatcher = new Dispatcher(theEngine);
@@ -1151,12 +1160,14 @@ void EventuallyPersistentStore::completeBGFetch(const std::string &key,
         // skip the measurement if the counter wrapped...
         ++stats.bgNumOperations;
         hrtime_t w = (start - init) / 1000;
+        BlockTimer::log(start - init, "bgwait");
         stats.bgWaitHisto.add(w);
         stats.bgWait += w;
         stats.bgMinWait.setIfLess(w);
         stats.bgMaxWait.setIfBigger(w);
 
         hrtime_t l = (stop - start) / 1000;
+        BlockTimer::log(stop - start, "bgload");
         stats.bgLoadHisto.add(l);
         stats.bgLoad += l;
         stats.bgMinLoad.setIfLess(l);
@@ -2122,7 +2133,8 @@ int EventuallyPersistentStore::flushOneDelOrSet(const queued_item &qi,
                 }
                 lh.unlock();
                 BlockTimer timer(rowid == -1 ?
-                                 &stats.diskInsertHisto : &stats.diskUpdateHisto);
+                                 &stats.diskInsertHisto : &stats.diskUpdateHisto,
+                                 rowid == -1 ? "disk_insert" : "disk_update");
 
                 PersistenceCallback *cb;
                 cb = new PersistenceCallback(qi, rejectQueue, this,
@@ -2139,7 +2151,7 @@ int EventuallyPersistentStore::flushOneDelOrSet(const queued_item &qi,
         }
     } else if (deleted) {
         lh.unlock();
-        BlockTimer timer(&stats.diskDelHisto);
+        BlockTimer timer(&stats.diskDelHisto, "disk_delete");
 
         PersistenceCallback *cb;
         cb = new PersistenceCallback(qi, rejectQueue, this, queued,
@@ -2429,7 +2441,7 @@ void TransactionContext::leave(int completed) {
 }
 
 void TransactionContext::commit() {
-    BlockTimer timer(&stats.diskCommitHisto);
+    BlockTimer timer(&stats.diskCommitHisto, "disk_commit");
     rel_time_t cstart = ep_current_time();
     while (!underlying->commit()) {
         sleep(1);
