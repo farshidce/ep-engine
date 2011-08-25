@@ -12,18 +12,46 @@ from threading import Thread
 from subprocess import Popen, PIPE, STDOUT
 
 #env TIMING_LOG=/tmp/leveldb.fetch.timings ../memcached/memcached -E .libs/ep.so -e 'initfile=t/init.sql;ht_size=1572869' -v
+#./management/mbflushctl localhost:11211 set mem_low_wat 5000000
+#./management/mbflushctl localhost:11211 set mem_high_wat 1300000000
 
+def run_mbflushctl(ip,port,ctl):
+   command = []
+   command.append("./management/mbflushctl")
+   command.append("{0}:{1}".format(ip,port))
+   command.extend(ctl) 
+   print "command : ",command
+   print os.getcwd()
+   mbctl = Popen(command)
+   return mbctl
 
-def _load_data_thread(keys,value,op,mc):
+def wait_till_no_lines(file,no_lines,timeout=600):
+   start = time.time()
+   while (time.time() - start) < timeout:
+      lines_count = sum(1 for line in open(file))
+      print "# of lines in file {0} : {1}".format(lines_count,file)
+      if lines_count > no_lines:
+         return True
+      else:
+         time.sleep(5)
+   return False
+
+def _load_data_thread(keys,value,op,command_center,mc):
    random.shuffle(keys)
-   for k in keys:
-      if op == 'set':
-         mc.set(k,0,0,value)
-      elif op == "delete":
-         try:
-            mc.delete(k)
-         except:
-            pass
+   while command_center["state"] == "run":
+      for k in keys:
+         if op == 'set':
+            mc.set(k,0,0,value)
+         elif op == "delete":
+            try:
+               mc.delete(k)
+            except:
+               pass
+         elif op == "get":
+            try:
+               mc.get(k)
+            except:
+               pass
 
 def create_value(pattern, size):
     return (pattern * (size / len(pattern))) + pattern[0:(size % len(pattern))]
@@ -31,18 +59,21 @@ def create_value(pattern, size):
 def load_data(no_items,insert,delete,no_threads,size,ip,port):
    _threads = []
    prefix = str(uuid.uuid4())
-   keys=["{0}-{1}".format(prefix,i) for i in range(1000000)]
+   keys=["{0}-{1}".format(prefix,i) for i in range(no_items)]
    value = create_value("*",size)
-   mc = mc_bin_client.MemcachedClient(ip,port)
+   command_center = {"state":"run"}
    if insert:
       for i in range(0,no_threads):
-         _t = Thread(name="insert-thread-{0}".format(i), target=_load_data_thread, args=(keys,value,'set',mc))
+         mc = mc_bin_client.MemcachedClient(ip,port)
+         _t = Thread(name="insert-thread-{0}".format(i), target=_load_data_thread, args=(keys,value,'set',command_center,mc))
          _threads.append(_t)
    if delete:
       pass
    for t in _threads:
       t.start()
-   return _threads
+      print "started thread {0}".format(t)
+   return _threads,keys,command_center
+
 
 def start_memcached(memcached_process,
                     timing_log,
@@ -61,6 +92,9 @@ def start_memcached(memcached_process,
    command.append("-v")
    print "command : ",command
    print os.getcwd()
+   #kill memcached processif one is running
+   kill_mc = Popen(["killall","-9","memcached"])
+   kill_mc.communicate()
    mc_process = Popen(command)
    return mc_process
 
@@ -76,6 +110,10 @@ if __name__ == "__main__":
                       help="number of threads", metavar="1")
     parser.add_option("-s", "--size", dest="size",default="256",
                       help="value size", metavar="256")
+    parser.add_option("--low_watermark", dest="low",default="1000000",
+                      help="memory low watermark", metavar="1000000")
+    parser.add_option("--high_watermark-", dest="high",default="3000000",
+                      help="memory high watermark", metavar="3000000")
 
 
     options, args = parser.parse_args()
@@ -84,13 +122,29 @@ if __name__ == "__main__":
     no_threads = int(options.no_threads)
     no_items = int(options.no_items)
     size = int(options.size)
+    low = int(options.low)
+    high = int(options.high)
     print size,no_items,no_threads,log,port
-    start_memcached("../memcached/memcached",log,port,"sqldb","initfile=t/init.sql")
+    mc_process = start_memcached("../memcached/memcached",log,port,"sqldb","initfile=t/init.sql")
     time.sleep(5)
-    threads = load_data(no_items,True,False,no_threads,size,"localhost",port)
+    threads,keys,command_center = load_data(no_items,True,False,no_threads,size,"localhost",port)
+    command_center["state"] = "stop"
+    abort_on_no_lines = (no_items * no_threads) * 0.9 
+    print "abort_on_no_lines : {0}".format(abort_on_no_lines)
+    wait_till_no_lines(log,int(abort_on_no_lines),timeout=600)
     for t in threads:
        t.join()
        print "thread {0} finished".format(t)
-
-
-
+    ctl1 = run_mbflushctl("localhost",port,["set","mem_low_wat","{0}".format(low)])
+    ctl2 = run_mbflushctl("localhost",port,["set","mem_high_wat","{0}".format(high)])
+    ctl1.communicate()
+    print "ctl1 completed"
+    ctl2.communicate()
+    print "ctl2 completed"
+    #now pass all those keys to a new thread which is going to read the data
+    mc = mc_bin_client.MemcachedClient("localhost",port)
+    fetch_thread = Thread(name="fetch-thread",target=_load_data_thread,args=(keys,"","get",mc))
+    fetch_thread.start()
+    fetch_thread.join()
+    print "thread {0} finished".format(fetch_thread)
+    mc_process.terminate()
